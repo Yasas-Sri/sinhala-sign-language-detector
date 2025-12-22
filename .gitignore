@@ -1,0 +1,7 @@
+Dataset
+archive
+preprocessed
+.venv
+__pycache__/
+*.pyc
+
