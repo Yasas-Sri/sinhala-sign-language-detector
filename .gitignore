@@ -4,4 +4,6 @@ preprocessed
 .venv
 __pycache__/
 *.pyc
-
+Dataset-MP-CSV
+ssl400_preprocessed_paper
+mlflow.db

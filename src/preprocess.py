@@ -1,85 +1,147 @@
+"""
+preprocess_paper.py -- SSL400 Replicated Pipeline
+Optimized for Hybrid CNN-BiLSTM + Attention as per Abhishek et al. (2025)
+"""
+
 import os
+import ast
 import numpy as np
 import pandas as pd
-import ast
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-import joblib
+from sklearn.preprocessing import LabelEncoder
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# ─────────────────────────────────────────────────────────
+#  CONFIGURATION (Paper Specs)
+# ─────────────────────────────────────────────────────────
+DATASET_ROOT   = "./Dataset - MP - CSV"
+OUTPUT_DIR     = "ssl400_processed_paper"
 
-BASE_DIR = os.path.dirname(SCRIPT_DIR)
+# The paper evaluates 10, 100, and 300 classes [cite: 108]
+# To match your previous run, we'll keep the filter at 10 samples
+MIN_SAMPLES_PER_CLASS = 2 
 
-DATASET_DIR = os.path.join(SCRIPT_DIR, "../Dataset")   
-MAX_SEQUENCE_LENGTH = 100     
-OUTPUT_DIR = "preprocessed"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+TARGET_FRAMES  = 30    # Key Spec: Paper uses K=30 
+N_LANDMARKS    = 33    # MediaPipe Holistic landmarks [cite: 42, 113]
+FEATURE_DIM    = 99    # 33 landmarks * (x, y, z) 
 
+TRAIN_RATIO    = 0.70
+VAL_RATIO      = 0.10
+TEST_RATIO     = 0.20
+RANDOM_SEED    = 42
 
-sequences = []
-labels = []
+# ══════════════════════════════════════════════════════════
+#  STEP 1 -- SELECTIVE TEMPORAL SAMPLING
+# ══════════════════════════════════════════════════════════
 
+def selective_temporal_sampling(seq, k=TARGET_FRAMES):
+    """
+    Computes total frames N and selects K evenly spaced frames.
+    This preserves gesture dynamics while reducing frame redundancy[cite: 46, 187].
+    """
+    n = len(seq)
+    if n == 0: 
+        return np.zeros((k, FEATURE_DIM), dtype=np.float32)
+    
+    # Generate K indices evenly spaced from 0 to N-1 
+    indices = np.linspace(0, n - 1, k).astype(int)
+    return seq[indices]
 
-for root, dirs, files in os.walk(DATASET_DIR):
-    for file in files:
-        if file.endswith(".csv"):
-            file_path = os.path.join(root, file)
+# ══════════════════════════════════════════════════════════
+#  STEP 2 -- DATA DISCOVERY & CSV PARSING
+# ══════════════════════════════════════════════════════════
+
+def collect_manifest(root, min_samples):
+    records = []
+    for category in sorted(os.listdir(root)):
+        cat_path = os.path.join(root, category)
+        if not os.path.isdir(cat_path): continue
+        for word in sorted(os.listdir(cat_path)):
+            word_path = os.path.join(cat_path, word)
+            if not os.path.isdir(word_path): continue
             
-            
-            label_name = os.path.basename(root)
-            
-           
-            df = pd.read_csv(file_path, header=None)
-            
-            sequence_data = []
-            
-            
-            for _, row in df.iterrows():
-                frame_features = []
-                for cell in row:
-                    try:
-                        
-                        values = ast.literal_eval(str(cell))
-                        frame_features.extend(values)
-                    except:
-                        
-                        frame_features.extend([0.0] * 4) 
-                
-                sequence_data.append(frame_features)
-            
-            sequences.append(np.array(sequence_data, dtype=np.float32))
-            labels.append(label_name)
+            files = [os.path.join(word_path, f) for f in os.listdir(word_path) if f.endswith(".csv")]
+            if len(files) >= min_samples:
+                for fp in files:
+                    records.append({"filepath": fp, "label": word})
+    return pd.DataFrame(records)
 
-print(f"Loaded {len(sequences)} samples across {len(set(labels))} classes.")
+def parse_csv_to_array(filepath):
+    """Parses MediaPipe landmarks and returns sampled sequence."""
+    df = pd.read_csv(filepath)
+    frames = []
+    # Paper focuses on skeletal keypoints [cite: 42, 48]
+    for _, row in df.iterrows():
+        coords = []
+        for col in df.columns[:N_LANDMARKS]:
+            try:
+                # Extract x, y, z from string format '[x, y, z, v]'
+                vals = ast.literal_eval(str(row[col]).strip())
+                coords.extend(vals[:3])
+            except:
+                coords.extend([0.0, 0.0, 0.0])
+        frames.append(coords)
+    
+    seq = np.array(frames, dtype=np.float32)
+    return selective_temporal_sampling(seq)
 
+# ══════════════════════════════════════════════════════════
+#  STEP 3 -- NORMALIZATION & SPLITTING
+# ══════════════════════════════════════════════════════════
 
-print("Normalizing data...")
-all_data = np.vstack(sequences)
-scaler = StandardScaler()
-scaler.fit(all_data)
+def process_and_save():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    df = collect_manifest(DATASET_ROOT, MIN_SAMPLES_PER_CLASS)
+    
+    # Stratified Split
+    le = LabelEncoder()
+    df['label_id'] = le.fit_transform(df['label'])
+    np.save(os.path.join(OUTPUT_DIR, "label_classes.npy"), le.classes_)
 
+    # Group by label to ensure even distribution
+    train_list, val_list, test_list = [], [], []
+    for _, group in df.groupby('label_id'):
+        group = group.sample(frac=1, random_state=RANDOM_SEED)
+        n = len(group)
+        n_train = int(n * TRAIN_RATIO)
+        n_val = int(n * VAL_RATIO)
+        
+        train_list.append(group.iloc[:n_train])
+        val_list.append(group.iloc[n_train : n_train + n_val])
+        test_list.append(group.iloc[n_train + n_val :])
 
-sequences_scaled = [scaler.transform(s) for s in sequences]
+    train_df = pd.concat(train_list)
+    val_df = pd.concat(val_list)
+    test_df = pd.concat(test_list)
 
-print("Padding sequences...")
-X = pad_sequences(
-    sequences_scaled,
-    maxlen=MAX_SEQUENCE_LENGTH,
-    padding="post",
-    truncating="post",
-    dtype="float32"
-)
+    # Load and Normalize
+    def load_set(manifest, name):
+        X, y = [], []
+        for i, row in manifest.iterrows():
+            arr = parse_csv_to_array(row['filepath'])
+            X.append(arr)
+            y.append(row['label_id'])
+            if i % 100 == 0: print(f"Processing {name}... {i}/{len(manifest)}", end="\r")
+        return np.stack(X), np.array(y)
 
-print("Encoding labels...")
-label_encoder = LabelEncoder()
-y = label_encoder.fit_transform(labels)
+    X_train, y_train = load_set(train_df, "Train")
+    X_val, y_val = load_set(val_df, "Val")
+    X_test, y_test = load_set(test_df, "Test")
 
+    # Paper uses normalization [cite: 132]
+    mean = X_train.mean(axis=(0, 1))
+    std = X_train.std(axis=(0, 1)) + 1e-8
+    
+    X_train = (X_train - mean) / std
+    X_val = (X_val - mean) / std
+    X_test = (X_test - mean) / std
 
-np.save(os.path.join(OUTPUT_DIR, "X.npy"), X)
-np.save(os.path.join(OUTPUT_DIR, "y.npy"), y)
-joblib.dump(label_encoder, os.path.join(OUTPUT_DIR, "label_encoder.pkl"))
-joblib.dump(scaler, os.path.join(OUTPUT_DIR, "scaler.pkl"))
+    # Save finalized data 
+    np.savez_compressed(os.path.join(OUTPUT_DIR, "train_data.npz"), X=X_train, y=y_train)
+    np.savez_compressed(os.path.join(OUTPUT_DIR, "val_data.npz"), X=X_val, y=y_val)
+    np.savez_compressed(os.path.join(OUTPUT_DIR, "test_data.npz"), X=X_test, y=y_test)
+    np.savez(os.path.join(OUTPUT_DIR, "norm_stats.npz"), mean=mean, std=std)
 
-print(f"\n Final Data Shape: {X.shape}")
-print(f"Features per frame: {X.shape[2]}")
-print(f"Saved to '{OUTPUT_DIR}' folder.")
+    print(f"\nPreprocess Complete! Classes: {len(le.classes_)}")
+    print(f"Input Shape: ({TARGET_FRAMES}, {FEATURE_DIM})")
+
+if __name__ == "__main__":
+    process_and_save()
