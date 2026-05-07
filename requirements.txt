@@ -8,3 +8,8 @@ streamlit
 mediapipe==0.10.11
 opencv-python
 torchvision
+psutil 
+prometheus-client
+seaborn
+evidently==0.2.8
+pydantic
