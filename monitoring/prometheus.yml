@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: "sign-language-model"
+    static_configs:
+      # This points to the metrics server running in your Streamlit app
+      - targets: ["host.docker.internal:8000", "localhost:8000"]
