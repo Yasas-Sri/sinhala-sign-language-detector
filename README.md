@@ -7,6 +7,8 @@ A real-time, interactive Sign Language Recognition (SLR) application built with 
 - **Real-Time Landmark Extraction**: Uses MediaPipe Holistic to track body and hand landmarks instantly.
 - **Deep Learning Model**: Utilizes a PyTorch hybrid architecture to process temporal sequences of skeletal landmarks.
 - **Experiment Tracking**: Integrated with **MLflow** to track training runs, log hyperparameters, and manage model versions.
+- **Production Monitoring**: Exposes live metrics (inference latency, prediction counts, CPU/memory usage) via **Prometheus** on port 8000, visualized through **Grafana** dashboards on port 3000.
+- **Data Drift Detection**: Uses **Evidently AI** to compare the production feature distribution against the training set, flagging when real-world pose data has shifted away from what the model was trained on.
 
 ## Dataset
 
