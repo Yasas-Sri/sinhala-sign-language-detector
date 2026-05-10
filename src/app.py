@@ -194,10 +194,16 @@ import torch
 import mediapipe as mp
 import os
 import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from notebooks.fc110562_Yasas.model import SLRHybridModel
+import time
+import csv
 
-st.set_page_config(page_title="SLR Pipeline", layout="wide")
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+from notebooks.hybridModel.model import SLRHybridModel
+
+# Import our custom metrics component
+from metrics import start_metrics_server, INFERENCE_LATENCY, TOTAL_PREDICTIONS
+
+st.set_page_config(page_title="Sign language detector", layout="wide")
 
 
 @st.cache_resource
@@ -227,6 +233,15 @@ def init_state():
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+            
+    # Start the Prometheus metrics server only once
+    if "metrics_started" not in st.session_state:
+        try:
+            start_metrics_server(port=8000)
+            st.session_state.metrics_started = True
+        except OSError:
+            # Port might already be in use if Streamlit reloads
+            pass
 
 init_state()
 
@@ -338,14 +353,15 @@ if st.session_state.camera_on:
             if st.session_state.recording:
                 n = st.session_state.frame_count
 
-                if n < 30:
+                CAPTURE_FRAMES = 30  
+
+                if n < CAPTURE_FRAMES:
                     if results.pose_landmarks:
                         lm = np.array([
                             [lk.x, lk.y, lk.z]
                             for lk in results.pose_landmarks.landmark
                         ]).flatten()[:99]
 
-                        
                         mid = (lm[11*3:11*3+3] + lm[12*3:12*3+3]) / 2
                         for i in range(0, 99, 3):
                             lm[i:i+3] -= mid
@@ -354,17 +370,24 @@ if st.session_state.camera_on:
                         st.session_state.frame_count += 1
                         n = st.session_state.frame_count
 
-                    overlay_text  = f"RECORDING  {n}/30"
+                    overlay_text  = f"RECORDING  {n}/{CAPTURE_FRAMES}"
                     overlay_color = (255, 100, 0)
-                    progress_placeholder.progress(n / 30)
-                    status_placeholder.info(f"Recording… {n}/30 frames")
+                    progress_placeholder.progress(n / CAPTURE_FRAMES)
+                    status_placeholder.info(f"Recording… {n}/{CAPTURE_FRAMES} frames")
 
                 else:
-                    
+
                     st.session_state.recording = False
                     progress_placeholder.empty()
 
-                    buf = np.array(st.session_state.buffer, dtype=np.float32)
+                    raw_buf = np.array(st.session_state.buffer, dtype=np.float32)
+                    
+                    if len(raw_buf) >= 30:
+                        indices = np.linspace(0, len(raw_buf) - 1, 30).astype(int)
+                        buf = raw_buf[indices]
+                    else:
+                        buf = raw_buf
+
                     if len(buf) == 30:
                         seq     = (buf - mean_stat) / (std_stat + 1e-8)
                         input_t = (torch.from_numpy(seq)
@@ -372,12 +395,34 @@ if st.session_state.camera_on:
                                         .unsqueeze(0)
                                         .to(device))
 
+                        # --- Start Latency Timer ---
+                        inference_start_time = time.time()
+                        
                         with torch.no_grad():
                             logits   = model(input_t)
                             probs    = torch.softmax(logits, dim=1)[0]
                             pred_idx = probs.argmax().item()
                             conf     = probs[pred_idx].item()
                             word     = str(class_names[pred_idx])
+
+                        
+                        latency = time.time() - inference_start_time
+                        INFERENCE_LATENCY.observe(latency)
+                        TOTAL_PREDICTIONS.labels(sign_class=word).inc()
+
+                        
+                        
+                        log_file = "production_logs.csv"
+                        file_exists = os.path.isfile(log_file)
+                        with open(log_file, "a", newline="") as f:
+                            writer = csv.writer(f)
+                            if not file_exists:
+                                # Write CSV headers 
+                                writer.writerow([f"feat_{i}" for i in range(99)] + ["predicted_class", "confidence"])
+                            
+
+                            mean_features = seq.mean(axis=0)
+                            writer.writerow(list(mean_features) + [word, conf])
 
                         st.session_state.last_word = word
                         st.session_state.last_conf = conf
@@ -387,7 +432,7 @@ if st.session_state.camera_on:
                         status_placeholder.success(" Done! Press Capture for next sign.")
                         sentence_placeholder.markdown(" ".join(st.session_state.sentence))
                     else:
-                        status_placeholder.warning(" Pose not detected in enough frames.")
+                        status_placeholder.warning(f" Not enough pose frames detected ({len(raw_buf)}/30 minimum).")
 
                     st.session_state.buffer      = []
                     st.session_state.frame_count = 0
